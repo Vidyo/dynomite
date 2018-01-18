@@ -92,7 +92,7 @@ florida_get_seeds(struct context * ctx, struct mbuf *seeds_buf) {
 
     struct sockaddr_in *remote;
     uint32_t sock;
-    uint32_t tmpres;
+    int32_t tmpres;
     uint8_t buf[BUFSIZ + 1];
 
     log_debug(LOG_VVERB, "Running florida_get_seeds!");
@@ -133,43 +133,53 @@ florida_get_seeds(struct context * ctx, struct mbuf *seeds_buf) {
     mbuf_rewind(seeds_buf);
 
     memset(buf, 0, sizeof(buf));
-    uint32_t htmlstart = 0;
-    uint8_t * htmlcontent;
-    uint8_t *ok = NULL;
+    uint8_t *htmlcontent;
+    uint8_t *ok;
+    uint32_t rx_total = 0;
 
-    //assume that the respsone payload is under BUF_SIZE
-    while ((tmpres = recv(sock, buf, BUFSIZ, 0)) > 0) {
+    // receive socket data until we get them all or RX buffer becomes full
+    // assume that the RX buffer big enough for at least whole HTML header
+    while ((tmpres = recv(sock, buf + rx_total, BUFSIZ - rx_total, 0)) > 0) {
+        rx_total += tmpres;
+    }
 
-        // Look for a OK response  in the first buffer output.
-        if (!ok)
-            ok = (uint8_t *) strstr((char *)buf, "200 OK\r\n");
-        if (ok == NULL) {
-            log_error("Received Error from Florida while getting seeds");
-            loga_hexdump(buf, tmpres, "Florida Response with %ld bytes of data", tmpres);
-            close(sock);
-            dn_free(remote);
-            return DN_ERROR;
+    if ((rx_total == 0) || ((tmpres < 0))){
+        log_error("Error on receiving data from Florida, rx_total %lu, res %ld", rx_total, tmpres);
+        close(sock);
+        dn_free(remote);
+        return DN_ERROR;
+    }
+
+    // Look for a OK response
+    ok = (uint8_t *) strstr((char *)buf, "200 OK\r\n");
+    if (ok == NULL) {
+        log_error("Error on receiving data from Florida, no OK response");
+        loga_hexdump(buf, rx_total, "Florida Response with %lu bytes of data", rx_total);
+        close(sock);
+        dn_free(remote);
+        return DN_ERROR;
+    }
+
+    // Look for a HTML content
+    htmlcontent = (uint8_t *) strstr((char *)buf, "\r\n\r\n");
+    if (htmlcontent == NULL) {
+        log_error("Error on receiving data from Florida, no HTML content");
+        loga_hexdump(buf, rx_total, "Florida Response with %lu bytes of data", rx_total);
+        close(sock);
+        dn_free(remote);
+        return DN_ERROR;
+    }
+
+    htmlcontent += 4;
+    mbuf_copy(seeds_buf, htmlcontent, rx_total - (htmlcontent - buf));
+
+    // RX buffer was full - still have data in a socket, continue reading
+    if (rx_total >= BUFSIZ) {
+        memset(buf, 0, sizeof(buf));
+        while ((tmpres = recv(sock, buf, BUFSIZ, 0)) > 0) {
+            mbuf_copy(seeds_buf, buf, tmpres);
+            memset(buf, 0, tmpres);
         }
-
-        if (htmlstart == 0) {
-            /* Under certain conditions this will not work.
-             * If the \r\n\r\n part is splitted into two messages
-             * it will fail to detect the beginning of HTML content
-             */
-            htmlcontent = (uint8_t *) strstr((char *)buf, "\r\n\r\n");
-            if(htmlcontent != NULL) {
-                htmlstart = 1;
-                htmlcontent += 4;
-            }
-        } else {
-            htmlcontent = buf;
-        }
-
-        if(htmlstart) {
-            mbuf_copy(seeds_buf, htmlcontent, tmpres - (htmlcontent - buf));
-        }
-
-        memset(buf, 0, tmpres);
     }
 
     if(tmpres < 0) {
@@ -180,7 +190,7 @@ florida_get_seeds(struct context * ctx, struct mbuf *seeds_buf) {
     dn_free(remote);
 
     if (mbuf_length(seeds_buf) == 0) {
-        log_error("No seeds were found in Florida response (htmlstart %u)", htmlstart);
+        log_error("Error on receiving data from Florida, no seed(s) in response");
         return DN_ERROR;
     }
 
